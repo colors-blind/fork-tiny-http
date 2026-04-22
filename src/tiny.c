@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <netdb.h>
 #include <time.h>
+#include <locale.h>
 #include "mynetlib.h"
 
 #define MAXLINE 1024
@@ -670,6 +671,9 @@ handler_t *Signal(int signum, handler_t *handler)
 
 int main(int argc, char *argv[])
 {
+    // 设置 locale 为 "C"，确保 strptime/strftime 正确解析英文日期
+    setlocale(LC_TIME, "C");
+
     // 初始化服务器启动时间
     startTime = time(NULL);
 
