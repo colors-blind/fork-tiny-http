@@ -1,0 +1,24 @@
+* Uses proxy env variable no_proxy == 'localhost,127.0.0.1,::1'
+* Host localhost:8080 was resolved.
+* IPv6: ::1
+* IPv4: 127.0.0.1
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0*   Trying [::1]:8080...
+* connect to ::1 port 8080 from ::1 port 59834 failed: 连接被拒绝
+*   Trying 127.0.0.1:8080...
+* Connected to localhost (127.0.0.1) port 8080
+> GET /index.html HTTP/1.1
+> Host: localhost:8080
+> User-Agent: curl/8.5.0
+> Accept: */*
+> 
+< HTTP/1.1 200 OK
+< Content-Type: text/html
+< Last-Modified: Wed, 22 Apr 2026 13:37:46 GMT
+< Content-Length: 15
+< 
+{ [15 bytes data]
+100    15  100    15    0     0  40322      0 --:--:-- --:--:-- --:--:-- 15000
+* Connection #0 to host localhost left intact
+<h1>hello</h1>

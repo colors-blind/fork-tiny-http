@@ -86,10 +86,38 @@ void writeAccessLog(const request_ctx_t *ctx)
     fclose(logFile);
 }
 
-long readRequestHeaders(buffered_reader_t *pbr, char *contentType, size_t contentTypeSize)
+// 解析 HTTP 日期格式（RFC1123），返回 time_t，失败返回 -1
+static time_t parseHttpDate(const char *dateStr)
+{
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+
+    // 尝试解析 RFC1123 格式: "Wed, 21 Oct 2015 07:28:00 GMT"
+    char *result = strptime(dateStr, "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    if (result == NULL)
+    {
+        // 解析失败，忽略这个头
+        return -1;
+    }
+
+    // 转换为 time_t（GMT 时间）
+    return timegm(&tm);
+}
+
+// 格式化 time_t 为 HTTP 日期格式（RFC1123）
+static void formatHttpDate(time_t t, char *buf, size_t bufSize)
+{
+    struct tm *gmtTime = gmtime(&t);
+    // RFC1123 格式: "Wed, 21 Oct 2015 07:28:00 GMT"
+    strftime(buf, bufSize, "%a, %d %b %Y %H:%M:%S GMT", gmtTime);
+}
+
+long readRequestHeaders(buffered_reader_t *pbr, char *contentType, size_t contentTypeSize, time_t *ifModifiedSince)
 {
     long contentLength = 0;
     char headerLine[MAXLINE];
+    *ifModifiedSince = -1; // 默认为 -1 表示没有这个头
+
     for (int i = 0;; i++)
     {
         ssize_t headerLength = bufReadLine(pbr, headerLine, MAXLINE);
@@ -124,6 +152,19 @@ long readRequestHeaders(buffered_reader_t *pbr, char *contentType, size_t conten
                 split++;
             size_t actualSize = headerLength - (split - headerLine) - 2; // -2 for CRLF
             snprintf(contentType, contentTypeSize, "%.*s", (int)actualSize, split);
+        }
+        if (strncasecmp(headerLine, "If-Modified-Since:", 19) == 0)
+        {
+            char *split = strchr(headerLine, ':');
+            split++;              // skip ':'
+            while (*split == ' ') // skip whitespaces
+                split++;
+            // 去掉末尾的 \r\n
+            char *end = split;
+            while (*end && *end != '\r' && *end != '\n')
+                end++;
+            *end = '\0';
+            *ifModifiedSince = parseHttpDate(split);
         }
     }
     return contentLength;
@@ -211,7 +252,7 @@ char *getMimeTypeString(char *path)
     return "text/plain";
 }
 
-int checkResource(int client, request_ctx_t *ctx, char *path, mode_t flag, long *psize)
+int checkResource(int client, request_ctx_t *ctx, char *path, mode_t flag, long *psize, time_t *pmtime)
 {
     struct stat fileinfo;
     if (stat(path, &fileinfo) == -1)
@@ -233,6 +274,10 @@ int checkResource(int client, request_ctx_t *ctx, char *path, mode_t flag, long 
     if (psize != NULL)
     {
         *psize = fileinfo.st_size;
+    }
+    if (pmtime != NULL)
+    {
+        *pmtime = fileinfo.st_mtime;
     }
     return 0;
 }
@@ -281,40 +326,96 @@ void serveServerStatus(int client, request_ctx_t *ctx)
     ctx->bytesSent += sendBytes(client, response, pos);
 }
 
-void serveHeadRequest(int client, request_ctx_t *ctx, char *path, int isDynamic)
+void serveHeadRequest(int client, request_ctx_t *ctx, char *path, int isDynamic, time_t ifModifiedSince)
 {
     printf("serving head request: %s\n", path);
     long size;
-    if (checkResource(client, ctx, path, S_IRUSR, &size) != 0)
+    time_t mtime;
+
+    if (checkResource(client, ctx, path, S_IRUSR, &size, &mtime) != 0)
     {
         return;
     }
-    ctx->statusCode = 200;
-    ctx->bytesSent = 0;
 
-    char buf[MAXLINE];
-    snprintf(buf, MAXLINE, "HTTP/1.1 200 OK\r\n");
-    ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+    // 动态内容不做缓存处理
     if (isDynamic)
     {
+        ctx->statusCode = 200;
+        ctx->bytesSent = 0;
+        char buf[MAXLINE];
+        snprintf(buf, MAXLINE, "HTTP/1.1 200 OK\r\n");
+        ctx->bytesSent += sendBytes(client, buf, strlen(buf));
         // unknown size: payload headers may be omitted according to RFC 7231
         ctx->bytesSent += sendBytes(client, "\r\n", 2);
         return;
     }
+
+    // 静态资源：检查缓存
+    // 如果 If-Modified-Since 存在且文件未修改，返回 304
+    if (ifModifiedSince != -1 && mtime <= ifModifiedSince)
+    {
+        ctx->statusCode = 304;
+        ctx->bytesSent = 0;
+        char buf[MAXLINE];
+        char lastModifiedStr[64];
+        formatHttpDate(mtime, lastModifiedStr, sizeof(lastModifiedStr));
+
+        snprintf(buf, MAXLINE, "HTTP/1.1 304 Not Modified\r\n");
+        ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+        snprintf(buf, MAXLINE, "Last-Modified: %s\r\n", lastModifiedStr);
+        ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+        snprintf(buf, MAXLINE, "\r\n");
+        ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+        return;
+    }
+
+    // 文件已修改或没有 If-Modified-Since，返回 200
+    ctx->statusCode = 200;
+    ctx->bytesSent = 0;
+    char buf[MAXLINE];
+    char lastModifiedStr[64];
+    formatHttpDate(mtime, lastModifiedStr, sizeof(lastModifiedStr));
+
+    snprintf(buf, MAXLINE, "HTTP/1.1 200 OK\r\n");
+    ctx->bytesSent += sendBytes(client, buf, strlen(buf));
     snprintf(buf, MAXLINE, "Content-Type: %s\r\n", getMimeTypeString(path));
+    ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+    snprintf(buf, MAXLINE, "Last-Modified: %s\r\n", lastModifiedStr);
     ctx->bytesSent += sendBytes(client, buf, strlen(buf));
     snprintf(buf, MAXLINE, "Content-Length: %zu\r\n\r\n", size);
     ctx->bytesSent += sendBytes(client, buf, strlen(buf));
 }
 
-void serveStatic(int client, request_ctx_t *ctx, char *path)
+void serveStatic(int client, request_ctx_t *ctx, char *path, time_t ifModifiedSince)
 {
     printf("serving static resource: %s\n", path);
     long size;
-    if (checkResource(client, ctx, path, S_IRUSR, &size) != 0)
+    time_t mtime;
+
+    if (checkResource(client, ctx, path, S_IRUSR, &size, &mtime) != 0)
     {
         return;
     }
+
+    // 检查缓存：如果 If-Modified-Since 存在且文件未修改，返回 304
+    if (ifModifiedSince != -1 && mtime <= ifModifiedSince)
+    {
+        ctx->statusCode = 304;
+        ctx->bytesSent = 0;
+        char buf[MAXLINE];
+        char lastModifiedStr[64];
+        formatHttpDate(mtime, lastModifiedStr, sizeof(lastModifiedStr));
+
+        snprintf(buf, MAXLINE, "HTTP/1.1 304 Not Modified\r\n");
+        ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+        snprintf(buf, MAXLINE, "Last-Modified: %s\r\n", lastModifiedStr);
+        ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+        snprintf(buf, MAXLINE, "\r\n");
+        ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+        return;
+    }
+
+    // 文件已修改或没有 If-Modified-Since，返回 200 并发送内容
     ctx->statusCode = 200;
     ctx->bytesSent = 0;
 
@@ -325,9 +426,14 @@ void serveStatic(int client, request_ctx_t *ctx, char *path)
     fclose(file);
 
     char buf[MAXLINE];
+    char lastModifiedStr[64];
+    formatHttpDate(mtime, lastModifiedStr, sizeof(lastModifiedStr));
+
     snprintf(buf, MAXLINE, "HTTP/1.1 200 OK\r\n");
     ctx->bytesSent += sendBytes(client, buf, strlen(buf));
     snprintf(buf, MAXLINE, "Content-Type: %s\r\n", getMimeTypeString(path));
+    ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+    snprintf(buf, MAXLINE, "Last-Modified: %s\r\n", lastModifiedStr);
     ctx->bytesSent += sendBytes(client, buf, strlen(buf));
     snprintf(buf, MAXLINE, "Content-Length: %zu\r\n\r\n", size);
     ctx->bytesSent += sendBytes(client, buf, strlen(buf));
@@ -339,7 +445,8 @@ void serveStatic(int client, request_ctx_t *ctx, char *path)
 void serveDynamic(int client, request_ctx_t *ctx, char *path, char *args, char *method, long inputLength, char *inputType, char *inputBuffer)
 {
     printf("serving dynamic resource: %s with args: %s\n", path, args);
-    if (checkResource(client, ctx, path, S_IXUSR, NULL) != 0)
+    // 动态内容不做缓存，checkResource 的 mtime 参数传 NULL
+    if (checkResource(client, ctx, path, S_IXUSR, NULL, NULL) != 0)
     {
         return;
     }
@@ -424,6 +531,7 @@ void handleClient(int client, const char *clientIp)
     char method[MAXLINE], uri[MAXLINE], version[MAXLINE];
     request_ctx_t ctx;
     char *inputBuffer = NULL;
+    time_t ifModifiedSince = -1; // 缓存相关：-1 表示没有 If-Modified-Since 头
 
     // 初始化请求上下文
     ctx.clientIp = clientIp;
@@ -473,7 +581,8 @@ void handleClient(int client, const char *clientIp)
 
     char contentType[MAXLINE];
     strcpy(contentType, "");
-    long contentLength = readRequestHeaders(&br, contentType, sizeof(contentType));
+    // 读取请求头，包括 If-Modified-Since
+    long contentLength = readRequestHeaders(&br, contentType, sizeof(contentType), &ifModifiedSince);
     char path[MAXLINE], args[MAXLINE];
     int isDynamic = parseURI(uri, path, args);
     if (verbose)
@@ -483,11 +592,12 @@ void handleClient(int client, const char *clientIp)
 
     if (strcmp(method, "HEAD") == 0)
     {
-        serveHeadRequest(client, &ctx, path, isDynamic);
+        serveHeadRequest(client, &ctx, path, isDynamic, ifModifiedSince);
     }
     else if (!isDynamic)
     {
-        serveStatic(client, &ctx, path);
+        // 只有 GET 请求走静态资源缓存逻辑，POST 不走
+        serveStatic(client, &ctx, path, ifModifiedSince);
     }
     else
     {
