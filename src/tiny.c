@@ -26,6 +26,11 @@
 #define DEFAULT_FILENAME "index.html"
 #define LOG_FILE BASEDIR "/access.log"
 
+// 限流配置：同一IP在10秒内最多20次请求
+#define RATE_LIMIT_WINDOW_SECS 10    // 时间窗口（秒）
+#define RATE_LIMIT_MAX_REQUESTS 20   // 每个窗口最大请求数
+#define RATE_LIMIT_MAX_IPS 100       // 最多跟踪多少个IP（防止内存增长）
+
 extern char **environ;
 int verbose = 0; // TODO: add command line flag
 
@@ -36,6 +41,19 @@ static long long count4xx = 0;
 static long long count5xx = 0;
 static time_t lastRequestTime = 0;
 static time_t startTime = 0;
+
+// 限流记录：每个IP的请求计数和时间窗口
+typedef struct
+{
+    char ip[MAXHOST];      // 客户端IP
+    int count;              // 当前窗口内的请求数
+    time_t windowStart;     // 当前时间窗口的开始时间
+} rate_limit_entry_t;
+
+// 限流表：固定大小数组，简化实现
+// 策略：线性搜索，过期清理，满了就替换最旧的记录
+static rate_limit_entry_t rateLimitTable[RATE_LIMIT_MAX_IPS];
+static int rateLimitCount = 0;  // 当前已使用的条目数
 
 // 请求上下文，用于在函数间传递请求信息
 typedef struct
@@ -86,6 +104,127 @@ void writeAccessLog(const request_ctx_t *ctx)
             timeStr, ctx->clientIp, ctx->method, ctx->url, ctx->statusCode, ctx->bytesSent);
 
     fclose(logFile);
+}
+
+// 限流检查：返回 1 表示允许通过，0 表示超限
+// 思路：
+// 1. 先清理所有过期的记录（窗口已结束）
+// 2. 查找该IP的记录
+// 3. 如果存在且在窗口内：检查计数是否超限
+// 4. 如果不存在或已过期：创建新记录（数组满了就替换最旧的）
+static int checkRateLimit(const char *clientIp)
+{
+    time_t now = time(NULL);
+    int i;
+
+    // 步骤1：清理过期记录，同时查找该IP是否存在
+    int foundIndex = -1;
+    int oldestIndex = 0;     // 最旧记录的索引（用于替换）
+    time_t oldestTime = now;
+
+    for (i = 0; i < rateLimitCount; i++)
+    {
+        // 检查是否过期：当前时间 - 窗口开始时间 > 窗口大小
+        if (now - rateLimitTable[i].windowStart > RATE_LIMIT_WINDOW_SECS)
+        {
+            // 过期记录：如果是最后一个，直接减少计数
+            // 为简化实现，我们不立即删除，而是在需要时重用
+            // 这里先标记，继续查找
+        }
+
+        // 记录最旧的时间（用于替换策略）
+        if (rateLimitTable[i].windowStart < oldestTime)
+        {
+            oldestTime = rateLimitTable[i].windowStart;
+            oldestIndex = i;
+        }
+
+        // 查找是否是目标IP
+        if (strcmp(rateLimitTable[i].ip, clientIp) == 0)
+        {
+            foundIndex = i;
+        }
+    }
+
+    // 步骤2：处理找到的IP记录
+    if (foundIndex != -1)
+    {
+        // 检查该记录的窗口是否已过期
+        if (now - rateLimitTable[foundIndex].windowStart > RATE_LIMIT_WINDOW_SECS)
+        {
+            // 窗口已过期：重置计数和时间
+            rateLimitTable[foundIndex].count = 1;
+            rateLimitTable[foundIndex].windowStart = now;
+            return 1;  // 允许通过
+        }
+        else
+        {
+            // 窗口内：检查是否超限
+            if (rateLimitTable[foundIndex].count >= RATE_LIMIT_MAX_REQUESTS)
+            {
+                return 0;  // 超限，拒绝
+            }
+            else
+            {
+                rateLimitTable[foundIndex].count++;
+                return 1;  // 允许通过
+            }
+        }
+    }
+
+    // 步骤3：IP不存在，需要创建新记录
+    // 先查找是否有过期的记录可以重用
+    for (i = 0; i < rateLimitCount; i++)
+    {
+        if (now - rateLimitTable[i].windowStart > RATE_LIMIT_WINDOW_SECS)
+        {
+            // 重用过期的记录
+            strncpy(rateLimitTable[i].ip, clientIp, MAXHOST - 1);
+            rateLimitTable[i].ip[MAXHOST - 1] = '\0';
+            rateLimitTable[i].count = 1;
+            rateLimitTable[i].windowStart = now;
+            return 1;
+        }
+    }
+
+    // 步骤4：没有过期记录，检查数组是否已满
+    if (rateLimitCount < RATE_LIMIT_MAX_IPS)
+    {
+        // 数组未满，添加新记录
+        strncpy(rateLimitTable[rateLimitCount].ip, clientIp, MAXHOST - 1);
+        rateLimitTable[rateLimitCount].ip[MAXHOST - 1] = '\0';
+        rateLimitTable[rateLimitCount].count = 1;
+        rateLimitTable[rateLimitCount].windowStart = now;
+        rateLimitCount++;
+        return 1;
+    }
+
+    // 步骤5：数组已满，替换最旧的记录（LRU简化版）
+    // 注意：这是一个妥协策略，可能会导致少数IP的计数被错误重置
+    // 但在内存受限的情况下，这是合理的权衡
+    strncpy(rateLimitTable[oldestIndex].ip, clientIp, MAXHOST - 1);
+    rateLimitTable[oldestIndex].ip[MAXHOST - 1] = '\0';
+    rateLimitTable[oldestIndex].count = 1;
+    rateLimitTable[oldestIndex].windowStart = now;
+    return 1;
+}
+
+// 返回429 Too Many Requests响应
+static void rateLimitResponse(int client, request_ctx_t *ctx)
+{
+    ctx->statusCode = 429;
+    ctx->bytesSent = 0;
+
+    char *message = "Too Many Requests - Rate limit exceeded\n";
+    char buf[MAXLINE];
+
+    snprintf(buf, MAXLINE, "HTTP/1.1 429 Too Many Requests\r\n");
+    ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+    snprintf(buf, MAXLINE, "Content-Type: text/plain\r\n");
+    ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+    snprintf(buf, MAXLINE, "Content-Length: %zu\r\n\r\n", strlen(message));
+    ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+    ctx->bytesSent += sendBytes(client, message, strlen(message));
 }
 
 // 手动解析 RFC1123 日期格式："Wed, 22 Apr 2026 13:37:46 GMT"
@@ -637,6 +776,14 @@ void handleClient(int client, const char *clientIp)
     if (verbose)
     {
         printf("Request - Method: %s URL: %s Version: %s\n", method, uri, version);
+    }
+
+    // 限流检查：在解析请求后、实际处理前
+    // 这样可以记录完整的 method 和 url 到日志
+    if (!checkRateLimit(clientIp))
+    {
+        rateLimitResponse(client, &ctx);
+        goto log_and_exit;
     }
 
     if (strcmp(version, "HTTP/1.1") != 0)
