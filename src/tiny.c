@@ -14,6 +14,8 @@
 #include <sys/wait.h>
 #include <netdb.h>
 #include <time.h>
+#include <locale.h>
+#include <ctype.h>
 #include "mynetlib.h"
 
 #define MAXLINE 1024
@@ -23,6 +25,11 @@
 #define BASEDIR "./wwwroot"
 #define DEFAULT_FILENAME "index.html"
 #define LOG_FILE BASEDIR "/access.log"
+
+// 限流配置：同一IP在10秒内最多20次请求
+#define RATE_LIMIT_WINDOW_SECS 10    // 时间窗口（秒）
+#define RATE_LIMIT_MAX_REQUESTS 20   // 每个窗口最大请求数
+#define RATE_LIMIT_MAX_IPS 100       // 最多跟踪多少个IP（防止内存增长）
 
 extern char **environ;
 int verbose = 0; // TODO: add command line flag
@@ -34,6 +41,19 @@ static long long count4xx = 0;
 static long long count5xx = 0;
 static time_t lastRequestTime = 0;
 static time_t startTime = 0;
+
+// 限流记录：每个IP的请求计数和时间窗口
+typedef struct
+{
+    char ip[MAXHOST];      // 客户端IP
+    int count;              // 当前窗口内的请求数
+    time_t windowStart;     // 当前时间窗口的开始时间
+} rate_limit_entry_t;
+
+// 限流表：固定大小数组，简化实现
+// 策略：线性搜索，过期清理，满了就替换最旧的记录
+static rate_limit_entry_t rateLimitTable[RATE_LIMIT_MAX_IPS];
+static int rateLimitCount = 0;  // 当前已使用的条目数
 
 // 请求上下文，用于在函数间传递请求信息
 typedef struct
@@ -86,30 +106,220 @@ void writeAccessLog(const request_ctx_t *ctx)
     fclose(logFile);
 }
 
-// 解析 HTTP 日期格式（RFC1123），返回 time_t，失败返回 -1
+// 限流检查：返回 1 表示允许通过，0 表示超限
+// 思路：
+// 1. 先清理所有过期的记录（窗口已结束）
+// 2. 查找该IP的记录
+// 3. 如果存在且在窗口内：检查计数是否超限
+// 4. 如果不存在或已过期：创建新记录（数组满了就替换最旧的）
+static int checkRateLimit(const char *clientIp)
+{
+    time_t now = time(NULL);
+    int i;
+
+    // 步骤1：清理过期记录，同时查找该IP是否存在
+    int foundIndex = -1;
+    int oldestIndex = 0;     // 最旧记录的索引（用于替换）
+    time_t oldestTime = now;
+
+    for (i = 0; i < rateLimitCount; i++)
+    {
+        // 检查是否过期：当前时间 - 窗口开始时间 > 窗口大小
+        if (now - rateLimitTable[i].windowStart > RATE_LIMIT_WINDOW_SECS)
+        {
+            // 过期记录：如果是最后一个，直接减少计数
+            // 为简化实现，我们不立即删除，而是在需要时重用
+            // 这里先标记，继续查找
+        }
+
+        // 记录最旧的时间（用于替换策略）
+        if (rateLimitTable[i].windowStart < oldestTime)
+        {
+            oldestTime = rateLimitTable[i].windowStart;
+            oldestIndex = i;
+        }
+
+        // 查找是否是目标IP
+        if (strcmp(rateLimitTable[i].ip, clientIp) == 0)
+        {
+            foundIndex = i;
+        }
+    }
+
+    // 步骤2：处理找到的IP记录
+    if (foundIndex != -1)
+    {
+        // 检查该记录的窗口是否已过期
+        if (now - rateLimitTable[foundIndex].windowStart > RATE_LIMIT_WINDOW_SECS)
+        {
+            // 窗口已过期：重置计数和时间
+            rateLimitTable[foundIndex].count = 1;
+            rateLimitTable[foundIndex].windowStart = now;
+            return 1;  // 允许通过
+        }
+        else
+        {
+            // 窗口内：检查是否超限
+            if (rateLimitTable[foundIndex].count >= RATE_LIMIT_MAX_REQUESTS)
+            {
+                return 0;  // 超限，拒绝
+            }
+            else
+            {
+                rateLimitTable[foundIndex].count++;
+                return 1;  // 允许通过
+            }
+        }
+    }
+
+    // 步骤3：IP不存在，需要创建新记录
+    // 先查找是否有过期的记录可以重用
+    for (i = 0; i < rateLimitCount; i++)
+    {
+        if (now - rateLimitTable[i].windowStart > RATE_LIMIT_WINDOW_SECS)
+        {
+            // 重用过期的记录
+            strncpy(rateLimitTable[i].ip, clientIp, MAXHOST - 1);
+            rateLimitTable[i].ip[MAXHOST - 1] = '\0';
+            rateLimitTable[i].count = 1;
+            rateLimitTable[i].windowStart = now;
+            return 1;
+        }
+    }
+
+    // 步骤4：没有过期记录，检查数组是否已满
+    if (rateLimitCount < RATE_LIMIT_MAX_IPS)
+    {
+        // 数组未满，添加新记录
+        strncpy(rateLimitTable[rateLimitCount].ip, clientIp, MAXHOST - 1);
+        rateLimitTable[rateLimitCount].ip[MAXHOST - 1] = '\0';
+        rateLimitTable[rateLimitCount].count = 1;
+        rateLimitTable[rateLimitCount].windowStart = now;
+        rateLimitCount++;
+        return 1;
+    }
+
+    // 步骤5：数组已满，替换最旧的记录（LRU简化版）
+    // 注意：这是一个妥协策略，可能会导致少数IP的计数被错误重置
+    // 但在内存受限的情况下，这是合理的权衡
+    strncpy(rateLimitTable[oldestIndex].ip, clientIp, MAXHOST - 1);
+    rateLimitTable[oldestIndex].ip[MAXHOST - 1] = '\0';
+    rateLimitTable[oldestIndex].count = 1;
+    rateLimitTable[oldestIndex].windowStart = now;
+    return 1;
+}
+
+// 返回429 Too Many Requests响应
+static void rateLimitResponse(int client, request_ctx_t *ctx)
+{
+    ctx->statusCode = 429;
+    ctx->bytesSent = 0;
+
+    char *message = "Too Many Requests - Rate limit exceeded\n";
+    char buf[MAXLINE];
+
+    snprintf(buf, MAXLINE, "HTTP/1.1 429 Too Many Requests\r\n");
+    ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+    snprintf(buf, MAXLINE, "Content-Type: text/plain\r\n");
+    ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+    snprintf(buf, MAXLINE, "Content-Length: %zu\r\n\r\n", strlen(message));
+    ctx->bytesSent += sendBytes(client, buf, strlen(buf));
+    ctx->bytesSent += sendBytes(client, message, strlen(message));
+}
+
+// 手动解析 RFC1123 日期格式："Wed, 22 Apr 2026 13:37:46 GMT"
+// 返回 time_t，失败返回 -1
 static time_t parseHttpDate(const char *dateStr)
 {
+    printf("[DEBUG] parseHttpDate: input=\"%s\"\n", dateStr);
+
     struct tm tm;
     memset(&tm, 0, sizeof(tm));
 
-    // 尝试解析 RFC1123 格式: "Wed, 21 Oct 2015 07:28:00 GMT"
-    char *result = strptime(dateStr, "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    if (result == NULL)
+    int day, year, hour, min, sec;
+    char monthStr[4]; // 3字母月份 + 结束符
+
+    // 格式字符串：
+    // %*[^ ] - 跳过所有非空格字符（跳过 "Wed"）
+    // %*[, ] - 跳过逗号和空格
+    // %d - 读取日期
+    // %3s - 读取3字符月份
+    // %d - 读取年份
+    // %d:%d:%d - 读取时:分:秒
+    int result = sscanf(dateStr, "%*[^ ]%*[, ]%d %3s %d %d:%d:%d",
+                        &day, monthStr, &year, &hour, &min, &sec);
+
+    printf("[DEBUG] parseHttpDate: sscanf returned %d, day=%d, month=%s, year=%d, time=%d:%d:%d\n",
+           result, day, monthStr, year, hour, min, sec);
+
+    if (result != 6)
+        return -1;
+
+    // 解析月份
+    const char *monthNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    int month = -1;
+    for (int i = 0; i < 12; i++)
     {
-        // 解析失败，忽略这个头
+        if (strcmp(monthStr, monthNames[i]) == 0)
+        {
+            month = i;
+            break;
+        }
+    }
+    if (month == -1)
+    {
+        printf("[DEBUG] parseHttpDate: month '%s' not found\n", monthStr);
         return -1;
     }
 
+    // 验证范围
+    if (year < 1970 || day < 1 || day > 31 ||
+        hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 || sec > 59)
+        return -1;
+
+    // 填充 tm 结构
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = min;
+    tm.tm_sec = sec;
+    tm.tm_isdst = 0; // 不考虑夏令时
+
     // 转换为 time_t（GMT 时间）
-    return timegm(&tm);
+    time_t parsed = timegm(&tm);
+    printf("[DEBUG] parseHttpDate: result=%lld\n", (long long)parsed);
+    return parsed;
 }
 
-// 格式化 time_t 为 HTTP 日期格式（RFC1123）
+// 手动格式化 time_t 为 RFC1123 日期格式
+// 格式: "Wed, 21 Oct 2015 07:28:00 GMT"
 static void formatHttpDate(time_t t, char *buf, size_t bufSize)
 {
+    if (bufSize < 30) // 最小需要约 29 个字符
+        return;
+
     struct tm *gmtTime = gmtime(&t);
-    // RFC1123 格式: "Wed, 21 Oct 2015 07:28:00 GMT"
-    strftime(buf, bufSize, "%a, %d %b %Y %H:%M:%S GMT", gmtTime);
+
+    // 星期名称（tm_wday: 0=Sunday, 1=Monday...）
+    const char *dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    // 月份名称（tm_mon: 0=January...）
+    const char *monthNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+    int year = gmtTime->tm_year + 1900;
+    int day = gmtTime->tm_mday;
+    int hour = gmtTime->tm_hour;
+    int min = gmtTime->tm_min;
+    int sec = gmtTime->tm_sec;
+
+    snprintf(buf, bufSize, "%s, %02d %s %d %02d:%02d:%02d GMT",
+             dayNames[gmtTime->tm_wday],
+             day,
+             monthNames[gmtTime->tm_mon],
+             year,
+             hour, min, sec);
 }
 
 long readRequestHeaders(buffered_reader_t *pbr, char *contentType, size_t contentTypeSize, time_t *ifModifiedSince)
@@ -164,7 +374,9 @@ long readRequestHeaders(buffered_reader_t *pbr, char *contentType, size_t conten
             while (*end && *end != '\r' && *end != '\n')
                 end++;
             *end = '\0';
+            printf("[DEBUG] readRequestHeaders: found If-Modified-Since, value=\"%s\"\n", split);
             *ifModifiedSince = parseHttpDate(split);
+            printf("[DEBUG] readRequestHeaders: ifModifiedAfter parse = %lld\n", (long long)*ifModifiedSince);
         }
     }
     return contentLength;
@@ -389,6 +601,8 @@ void serveHeadRequest(int client, request_ctx_t *ctx, char *path, int isDynamic,
 void serveStatic(int client, request_ctx_t *ctx, char *path, time_t ifModifiedSince)
 {
     printf("serving static resource: %s\n", path);
+    printf("[DEBUG] serveStatic: ifModifiedSince=%lld\n", (long long)ifModifiedSince);
+
     long size;
     time_t mtime;
 
@@ -397,9 +611,13 @@ void serveStatic(int client, request_ctx_t *ctx, char *path, time_t ifModifiedSi
         return;
     }
 
+    printf("[DEBUG] serveStatic: file mtime=%lld\n", (long long)mtime);
+    printf("[DEBUG] serveStatic: mtime <= ifModifiedSince? %d\n", mtime <= ifModifiedSince);
+
     // 检查缓存：如果 If-Modified-Since 存在且文件未修改，返回 304
     if (ifModifiedSince != -1 && mtime <= ifModifiedSince)
     {
+        printf("[DEBUG] serveStatic: returning 304 Not Modified\n");
         ctx->statusCode = 304;
         ctx->bytesSent = 0;
         char buf[MAXLINE];
@@ -560,6 +778,14 @@ void handleClient(int client, const char *clientIp)
         printf("Request - Method: %s URL: %s Version: %s\n", method, uri, version);
     }
 
+    // 限流检查：在解析请求后、实际处理前
+    // 这样可以记录完整的 method 和 url 到日志
+    if (!checkRateLimit(clientIp))
+    {
+        rateLimitResponse(client, &ctx);
+        goto log_and_exit;
+    }
+
     if (strcmp(version, "HTTP/1.1") != 0)
     {
         errorResponse(client, &ctx, 505, "HTTP Version Not Supported", NULL);
@@ -670,6 +896,9 @@ handler_t *Signal(int signum, handler_t *handler)
 
 int main(int argc, char *argv[])
 {
+    // 设置 locale 为 "C"，确保 strptime/strftime 正确解析英文日期
+    setlocale(LC_TIME, "C");
+
     // 初始化服务器启动时间
     startTime = time(NULL);
 
