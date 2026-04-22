@@ -55,6 +55,257 @@ typedef struct
 static rate_limit_entry_t rateLimitTable[RATE_LIMIT_MAX_IPS];
 static int rateLimitCount = 0;  // 当前已使用的条目数
 
+// 服务器配置
+typedef struct
+{
+    int port;
+    int enable_access_log;  // 1=开启, 0=关闭
+} server_config_t;
+
+static server_config_t serverConfig;
+
+// 简化版 JSON 解析器（只解析我们需要的字段）
+// 支持格式：
+// {
+//   "port": 8080,
+//   "enable_access_log": true
+// }
+// 注意：这是一个极简实现，不支持：
+// - 嵌套对象
+// - 数组
+// - 字符串值（除了 key）
+// - 转义字符
+// - 注释
+
+static void skipWhitespace(const char **p)
+{
+    while (**p && (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r'))
+        (*p)++;
+}
+
+// 解析字符串 key，返回 1 成功，0 失败
+// 期望格式："key"
+static int parseJsonString(const char **p, char *buf, int bufSize)
+{
+    if (**p != '"')
+        return 0;
+    (*p)++;
+
+    int i = 0;
+    while (**p && **p != '"' && i < bufSize - 1)
+    {
+        buf[i++] = **p;
+        (*p)++;
+    }
+    buf[i] = '\0';
+
+    if (**p != '"')
+        return 0;
+    (*p)++;
+    return 1;
+}
+
+// 解析布尔值，返回 1=成功，0=失败
+static int parseJsonBool(const char **p, int *result)
+{
+    if (strncmp(*p, "true", 4) == 0)
+    {
+        *p += 4;
+        *result = 1;
+        return 1;
+    }
+    if (strncmp(*p, "false", 5) == 0)
+    {
+        *p += 5;
+        *result = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// 解析整数，返回 1=成功，0=失败
+static int parseJsonInt(const char **p, int *result)
+{
+    int sign = 1;
+    if (**p == '-')
+    {
+        sign = -1;
+        (*p)++;
+    }
+
+    if (!isdigit(**p))
+        return 0;
+
+    int val = 0;
+    while (isdigit(**p))
+    {
+        val = val * 10 + (**p - '0');
+        (*p)++;
+    }
+
+    *result = sign * val;
+    return 1;
+}
+
+// 从文件读取并解析配置
+// 返回 0=成功，-1=失败
+static int loadConfigFromFile(const char *filepath, server_config_t *cfg)
+{
+    FILE *f = fopen(filepath, "r");
+    if (f == NULL)
+    {
+        fprintf(stderr, "Error: cannot open config file: %s (%s)\n",
+                filepath, strerror(errno));
+        return -1;
+    }
+
+    // 读取整个文件到内存（简化实现，假设配置文件很小）
+    fseek(f, 0, SEEK_END);
+    long fileSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (fileSize <= 0 || fileSize > 1024 * 10)  // 最大 10KB
+    {
+        fprintf(stderr, "Error: config file is too large or empty\n");
+        fclose(f);
+        return -1;
+    }
+
+    char *content = malloc(fileSize + 1);
+    if (content == NULL)
+    {
+        perror("malloc");
+        fclose(f);
+        return -1;
+    }
+
+    size_t readSize = fread(content, 1, fileSize, f);
+    content[readSize] = '\0';
+    fclose(f);
+
+    // 初始化配置标记（用于检测必填字段）
+    int hasPort = 0;
+    int hasEnableLog = 0;
+
+    // 解析 JSON
+    const char *p = content;
+    skipWhitespace(&p);
+
+    if (*p != '{')
+    {
+        fprintf(stderr, "Error: config file must be a JSON object (starts with '{')\n");
+        free(content);
+        return -1;
+    }
+    p++;
+
+    while (1)
+    {
+        skipWhitespace(&p);
+
+        if (*p == '}')
+            break;
+
+        if (*p == ',')
+        {
+            p++;
+            skipWhitespace(&p);
+        }
+
+        // 解析 key
+        char key[256];
+        if (!parseJsonString(&p, key, sizeof(key)))
+        {
+            fprintf(stderr, "Error: invalid JSON key near position %ld\n", p - content);
+            free(content);
+            return -1;
+        }
+
+        skipWhitespace(&p);
+        if (*p != ':')
+        {
+            fprintf(stderr, "Error: expected ':' after key '%s'\n", key);
+            free(content);
+            return -1;
+        }
+        p++;
+        skipWhitespace(&p);
+
+        // 解析 value
+        if (strcmp(key, "port") == 0)
+        {
+            int port;
+            if (!parseJsonInt(&p, &port))
+            {
+                fprintf(stderr, "Error: 'port' must be an integer\n");
+                free(content);
+                return -1;
+            }
+            if (port < 1 || port > 65535)
+            {
+                fprintf(stderr, "Error: 'port' must be between 1 and 65535\n");
+                free(content);
+                return -1;
+            }
+            cfg->port = port;
+            hasPort = 1;
+        }
+        else if (strcmp(key, "enable_access_log") == 0)
+        {
+            int val;
+            if (!parseJsonBool(&p, &val))
+            {
+                fprintf(stderr, "Error: 'enable_access_log' must be true or false\n");
+                free(content);
+                return -1;
+            }
+            cfg->enable_access_log = val;
+            hasEnableLog = 1;
+        }
+        else
+        {
+            // 忽略未知字段，但跳过它的值
+            if (*p == '"')
+            {
+                char dummy[256];
+                parseJsonString(&p, dummy, sizeof(dummy));
+            }
+            else if (isdigit(*p) || *p == '-')
+            {
+                int dummy;
+                parseJsonInt(&p, &dummy);
+            }
+            else if (*p == 't' || *p == 'f')
+            {
+                int dummy;
+                parseJsonBool(&p, &dummy);
+            }
+            else
+            {
+                // 尝试跳过这个值（简化处理）
+                while (*p && *p != ',' && *p != '}')
+                    p++;
+            }
+        }
+    }
+
+    free(content);
+
+    // 检查必填字段
+    if (!hasPort)
+    {
+        fprintf(stderr, "Error: missing required field 'port' in config file\n");
+        return -1;
+    }
+    if (!hasEnableLog)
+    {
+        fprintf(stderr, "Error: missing required field 'enable_access_log' in config file\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 // 请求上下文，用于在函数间传递请求信息
 typedef struct
 {
@@ -88,6 +339,10 @@ void updateStats(int statusCode)
 // 写访问日志到文件，失败时仅输出到stderr
 void writeAccessLog(const request_ctx_t *ctx)
 {
+    // 检查配置：如果关闭了访问日志，直接返回
+    if (!serverConfig.enable_access_log)
+        return;
+
     FILE *logFile = fopen(LOG_FILE, "a");
     if (logFile == NULL)
     {
@@ -902,18 +1157,62 @@ int main(int argc, char *argv[])
     // 初始化服务器启动时间
     startTime = time(NULL);
 
-    if (argc != 2)
+    // 初始化默认配置
+    serverConfig.port = 0;
+    serverConfig.enable_access_log = 1;  // 默认开启日志
+
+    // 解析命令行参数
+    if (argc == 2)
+    {
+        // 旧方式：./tiny 8080
+        // 检查是否是数字（port）还是 --config
+        char *endptr;
+        long portNum = strtol(argv[1], &endptr, 10);
+
+        if (*endptr == '\0' && portNum > 0 && portNum <= 65535)
+        {
+            // 是 port 数字
+            serverConfig.port = (int)portNum;
+            serverConfig.enable_access_log = 1;  // 默认开启
+        }
+        else
+        {
+            fprintf(stderr, "usage: %s <port>\n", argv[0]);
+            fprintf(stderr, "   or: %s --config <config_file>\n", argv[0]);
+            exit(EXIT_FAILURE);
+        }
+    }
+    else if (argc == 3)
+    {
+        // 新方式：./tiny --config ./server.json
+        if (strcmp(argv[1], "--config") != 0)
+        {
+            fprintf(stderr, "usage: %s <port>\n", argv[0]);
+            fprintf(stderr, "   or: %s --config <config_file>\n", argv[0]);
+            exit(EXIT_FAILURE);
+        }
+
+        // 从配置文件加载
+        if (loadConfigFromFile(argv[2], &serverConfig) != 0)
+        {
+            exit(EXIT_FAILURE);
+        }
+    }
+    else
     {
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
+        fprintf(stderr, "   or: %s --config <config_file>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    char *port = argv[1];
+    // 将 port 转换为字符串（port 传递给 serverListen 需要字符串）
+    char portStr[16];
+    snprintf(portStr, sizeof(portStr), "%d", serverConfig.port);
 
-    int listenSocket = serverListen(port);
+    int listenSocket = serverListen(portStr);
     if (listenSocket == -1)
     {
-        fprintf(stderr, "cant't listen on port %s\n", port);
+        fprintf(stderr, "cant't listen on port %d\n", serverConfig.port);
         exit(EXIT_FAILURE);
     }
 
@@ -925,7 +1224,8 @@ int main(int argc, char *argv[])
     char clientHost[MAXHOST];
     char clientPort[MAXPORT];
 
-    printf("listening on port %s\n", port);
+    printf("listening on port %d\n", serverConfig.port);
+    printf("config: access_log=%s\n", serverConfig.enable_access_log ? "enabled" : "disabled");
     while (1)
     {
         struct sockaddr_storage address;
