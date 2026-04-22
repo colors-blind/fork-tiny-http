@@ -15,6 +15,7 @@
 #include <netdb.h>
 #include <time.h>
 #include <locale.h>
+#include <ctype.h>
 #include "mynetlib.h"
 
 #define MAXLINE 1024
@@ -87,30 +88,103 @@ void writeAccessLog(const request_ctx_t *ctx)
     fclose(logFile);
 }
 
-// 解析 HTTP 日期格式（RFC1123），返回 time_t，失败返回 -1
+// 手动解析 RFC1123 日期格式："Wed, 22 Apr 2026 13:37:46 GMT"
+// 返回 time_t，失败返回 -1
 static time_t parseHttpDate(const char *dateStr)
 {
     struct tm tm;
     memset(&tm, 0, sizeof(tm));
 
-    // 尝试解析 RFC1123 格式: "Wed, 21 Oct 2015 07:28:00 GMT"
-    char *result = strptime(dateStr, "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    if (result == NULL)
-    {
-        // 解析失败，忽略这个头
+    // 格式: "星期, 日期 月份 年份 时:分:秒 GMT"
+    // 跳过星期和 ", " (比如 "Wed, ")
+    const char *p = strchr(dateStr, ' ');
+    if (p == NULL)
         return -1;
+    p++; // 跳过空格
+
+    // 解析日期（1-2位数字）
+    int day = atoi(p);
+    while (*p == ' ') p++;
+    if (!isdigit(*p))
+        return -1;
+    while (isdigit(*p)) p++;
+    if (*p != ' ')
+        return -1;
+    p++;
+
+    // 解析月份（3字母英文）
+    const char *monthNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    int month = -1;
+    for (int i = 0; i < 12; i++)
+    {
+        if (strncmp(p, monthNames[i], 3) == 0)
+        {
+            month = i;
+            break;
+        }
     }
+    if (month == -1)
+        return -1;
+    p += 3;
+    if (*p != ' ')
+        return -1;
+    p++;
+
+    // 解析年份（4位数字）
+    int year = atoi(p);
+    if (year < 1970)
+        return -1;
+    while (isdigit(*p)) p++;
+    if (*p != ' ')
+        return -1;
+    p++;
+
+    // 解析时:分:秒
+    int hour, min, sec;
+    if (sscanf(p, "%d:%d:%d", &hour, &min, &sec) != 3)
+        return -1;
+
+    // 填充 tm 结构
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = min;
+    tm.tm_sec = sec;
+    tm.tm_isdst = 0; // 不考虑夏令时
 
     // 转换为 time_t（GMT 时间）
     return timegm(&tm);
 }
 
-// 格式化 time_t 为 HTTP 日期格式（RFC1123）
+// 手动格式化 time_t 为 RFC1123 日期格式
+// 格式: "Wed, 21 Oct 2015 07:28:00 GMT"
 static void formatHttpDate(time_t t, char *buf, size_t bufSize)
 {
+    if (bufSize < 30) // 最小需要约 29 个字符
+        return;
+
     struct tm *gmtTime = gmtime(&t);
-    // RFC1123 格式: "Wed, 21 Oct 2015 07:28:00 GMT"
-    strftime(buf, bufSize, "%a, %d %b %Y %H:%M:%S GMT", gmtTime);
+
+    // 星期名称（tm_wday: 0=Sunday, 1=Monday...）
+    const char *dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    // 月份名称（tm_mon: 0=January...）
+    const char *monthNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+    int year = gmtTime->tm_year + 1900;
+    int day = gmtTime->tm_mday;
+    int hour = gmtTime->tm_hour;
+    int min = gmtTime->tm_min;
+    int sec = gmtTime->tm_sec;
+
+    snprintf(buf, bufSize, "%s, %02d %s %d %02d:%02d:%02d GMT",
+             dayNames[gmtTime->tm_wday],
+             day,
+             monthNames[gmtTime->tm_mon],
+             year,
+             hour, min, sec);
 }
 
 long readRequestHeaders(buffered_reader_t *pbr, char *contentType, size_t contentTypeSize, time_t *ifModifiedSince)
