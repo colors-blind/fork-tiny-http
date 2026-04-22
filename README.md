@@ -41,12 +41,40 @@ While `master` branch is iterative (handling one client request at a time), this
 
 ## Building and Running
 
+### 方式一：使用命令行参数（兼容旧方式）
+
 ```
 $ cd src
 $ make clean
 $ make
 $ ./tiny 8080   # or another port number
 ```
+
+这种方式默认开启访问日志。
+
+### 方式二：使用配置文件
+
+```
+$ cd src
+$ make clean
+$ make
+$ ./tiny --config ../server.json
+```
+
+配置文件格式示例（`server.json`）：
+
+```json
+{
+  "port": 8080,
+  "enable_access_log": true
+}
+```
+
+配置项说明：
+- `port`: 监听端口（1-65535）
+- `enable_access_log`: 是否开启访问日志（true/false）
+
+**注意**：配置文件中的两个字段都是必填的。
 
 ## Usage Examples
 
