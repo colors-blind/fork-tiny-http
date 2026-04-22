@@ -92,18 +92,14 @@ void writeAccessLog(const request_ctx_t *ctx)
 // 返回 time_t，失败返回 -1
 static time_t parseHttpDate(const char *dateStr)
 {
+    printf("[DEBUG] parseHttpDate: input=\"%s\"\n", dateStr);
+
     struct tm tm;
     memset(&tm, 0, sizeof(tm));
-
-    // 格式: "星期, 日期 月份 年份 时:分:秒 GMT"
-    // 使用 sscanf 简化解析，避免 locale 问题
-    // 注意：%*s 跳过星期（不存储），%*[,] 跳过逗号
-    // 但 sscanf 的 %s 会自动跳过空格，所以我们可以用更简单的方式
 
     int day, year, hour, min, sec;
     char monthStr[4]; // 3字母月份 + 结束符
 
-    // 解析：跳过 "Wed, "，然后读取 "22 Apr 2026 13:37:46"
     // 格式字符串：
     // %*[^ ] - 跳过所有非空格字符（跳过 "Wed"）
     // %*[, ] - 跳过逗号和空格
@@ -113,6 +109,9 @@ static time_t parseHttpDate(const char *dateStr)
     // %d:%d:%d - 读取时:分:秒
     int result = sscanf(dateStr, "%*[^ ]%*[, ]%d %3s %d %d:%d:%d",
                         &day, monthStr, &year, &hour, &min, &sec);
+
+    printf("[DEBUG] parseHttpDate: sscanf returned %d, day=%d, month=%s, year=%d, time=%d:%d:%d\n",
+           result, day, monthStr, year, hour, min, sec);
 
     if (result != 6)
         return -1;
@@ -130,7 +129,10 @@ static time_t parseHttpDate(const char *dateStr)
         }
     }
     if (month == -1)
+    {
+        printf("[DEBUG] parseHttpDate: month '%s' not found\n", monthStr);
         return -1;
+    }
 
     // 验证范围
     if (year < 1970 || day < 1 || day > 31 ||
@@ -147,7 +149,9 @@ static time_t parseHttpDate(const char *dateStr)
     tm.tm_isdst = 0; // 不考虑夏令时
 
     // 转换为 time_t（GMT 时间）
-    return timegm(&tm);
+    time_t parsed = timegm(&tm);
+    printf("[DEBUG] parseHttpDate: result=%lld\n", (long long)parsed);
+    return parsed;
 }
 
 // 手动格式化 time_t 为 RFC1123 日期格式
@@ -231,7 +235,9 @@ long readRequestHeaders(buffered_reader_t *pbr, char *contentType, size_t conten
             while (*end && *end != '\r' && *end != '\n')
                 end++;
             *end = '\0';
+            printf("[DEBUG] readRequestHeaders: found If-Modified-Since, value=\"%s\"\n", split);
             *ifModifiedSince = parseHttpDate(split);
+            printf("[DEBUG] readRequestHeaders: ifModifiedAfter parse = %lld\n", (long long)*ifModifiedSince);
         }
     }
     return contentLength;
@@ -456,6 +462,8 @@ void serveHeadRequest(int client, request_ctx_t *ctx, char *path, int isDynamic,
 void serveStatic(int client, request_ctx_t *ctx, char *path, time_t ifModifiedSince)
 {
     printf("serving static resource: %s\n", path);
+    printf("[DEBUG] serveStatic: ifModifiedSince=%lld\n", (long long)ifModifiedSince);
+
     long size;
     time_t mtime;
 
@@ -464,9 +472,13 @@ void serveStatic(int client, request_ctx_t *ctx, char *path, time_t ifModifiedSi
         return;
     }
 
+    printf("[DEBUG] serveStatic: file mtime=%lld\n", (long long)mtime);
+    printf("[DEBUG] serveStatic: mtime <= ifModifiedSince? %d\n", mtime <= ifModifiedSince);
+
     // 检查缓存：如果 If-Modified-Since 存在且文件未修改，返回 304
     if (ifModifiedSince != -1 && mtime <= ifModifiedSince)
     {
+        printf("[DEBUG] serveStatic: returning 304 Not Modified\n");
         ctx->statusCode = 304;
         ctx->bytesSent = 0;
         char buf[MAXLINE];
