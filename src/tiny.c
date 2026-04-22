@@ -96,29 +96,34 @@ static time_t parseHttpDate(const char *dateStr)
     memset(&tm, 0, sizeof(tm));
 
     // 格式: "星期, 日期 月份 年份 时:分:秒 GMT"
-    // 跳过星期和 ", " (比如 "Wed, ")
-    const char *p = strchr(dateStr, ' ');
-    if (p == NULL)
-        return -1;
-    p++; // 跳过空格
+    // 使用 sscanf 简化解析，避免 locale 问题
+    // 注意：%*s 跳过星期（不存储），%*[,] 跳过逗号
+    // 但 sscanf 的 %s 会自动跳过空格，所以我们可以用更简单的方式
 
-    // 解析日期（1-2位数字）
-    int day = atoi(p);
-    while (*p == ' ') p++;
-    if (!isdigit(*p))
-        return -1;
-    while (isdigit(*p)) p++;
-    if (*p != ' ')
-        return -1;
-    p++;
+    int day, year, hour, min, sec;
+    char monthStr[4]; // 3字母月份 + 结束符
 
-    // 解析月份（3字母英文）
+    // 解析：跳过 "Wed, "，然后读取 "22 Apr 2026 13:37:46"
+    // 格式字符串：
+    // %*[^ ] - 跳过所有非空格字符（跳过 "Wed"）
+    // %*[, ] - 跳过逗号和空格
+    // %d - 读取日期
+    // %3s - 读取3字符月份
+    // %d - 读取年份
+    // %d:%d:%d - 读取时:分:秒
+    int result = sscanf(dateStr, "%*[^ ]%*[, ]%d %3s %d %d:%d:%d",
+                        &day, monthStr, &year, &hour, &min, &sec);
+
+    if (result != 6)
+        return -1;
+
+    // 解析月份
     const char *monthNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     int month = -1;
     for (int i = 0; i < 12; i++)
     {
-        if (strncmp(p, monthNames[i], 3) == 0)
+        if (strcmp(monthStr, monthNames[i]) == 0)
         {
             month = i;
             break;
@@ -126,23 +131,10 @@ static time_t parseHttpDate(const char *dateStr)
     }
     if (month == -1)
         return -1;
-    p += 3;
-    if (*p != ' ')
-        return -1;
-    p++;
 
-    // 解析年份（4位数字）
-    int year = atoi(p);
-    if (year < 1970)
-        return -1;
-    while (isdigit(*p)) p++;
-    if (*p != ' ')
-        return -1;
-    p++;
-
-    // 解析时:分:秒
-    int hour, min, sec;
-    if (sscanf(p, "%d:%d:%d", &hour, &min, &sec) != 3)
+    // 验证范围
+    if (year < 1970 || day < 1 || day > 31 ||
+        hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 || sec > 59)
         return -1;
 
     // 填充 tm 结构
